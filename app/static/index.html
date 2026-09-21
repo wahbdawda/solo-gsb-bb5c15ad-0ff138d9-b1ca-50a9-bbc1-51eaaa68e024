@@ -17,6 +17,7 @@
   </div>
   <nav class="tabs">
     <button class="tab active" data-tab="inject">告警注入</button>
+    <button class="tab" data-tab="events">事件关联</button>
     <button class="tab" data-tab="rules">抑制规则</button>
     <button class="tab" data-tab="compare">策略对比</button>
     <button class="tab" data-tab="receiver">模拟接收端</button>
@@ -69,6 +70,53 @@
         </table>
       </div>
     </div>
+  </section>
+
+  <!-- ===================== 事件关联 ===================== -->
+  <section id="tab-events" class="panel">
+    <div class="card">
+      <h2>事件关联工作台
+        <span class="badge" id="ev-total">0 事件</span>
+        <span class="badge pass" id="ev-unacked">0 未确认</span>
+        <span class="badge" id="ev-interval">间隔 -s</span>
+      </h2>
+      <p class="hint">对<strong>已注入告警</strong>按 <code>device_id + alert_type</code> 分组，组内按告警时间排序，
+        相邻告警时间差 <strong>≤ 聚合间隔</strong> 即并入同一事件。乱序告警与间隔调整都以
+        <code>(时间, 注入序号)</code> 全量确定性重算，<strong>不会改变 live / replay 的放行与抑制决定</strong>。
+        事件以「成员告警集合」为稳定标识，成员集合不变时确认状态跨重算保留。</p>
+      <div class="toolbar">
+        <label style="margin:0;min-width:280px">聚合时间间隔（秒，0=仅同一时刻）
+          <input type="number" id="ev-interval-input" min="0" max="604800" step="10">
+        </label>
+        <button class="btn primary" id="btn-ev-save-interval">保存间隔并重算</button>
+        <button class="btn" id="btn-ev-recompute">🔁 立即重算</button>
+      </div>
+      <div class="ev-filters">
+        <label>设备
+          <select id="ev-filter-device"><option value="">全部设备</option></select>
+        </label>
+        <label>最低级别
+          <select id="ev-filter-level">
+            <option value="">全部级别</option>
+            <option value="info">info 及以上</option>
+            <option value="warning">warning 及以上</option>
+            <option value="critical">仅 critical</option>
+          </select>
+        </label>
+        <label>起始时间（事件结束 ≥）<input type="datetime-local" id="ev-filter-start" step="1"></label>
+        <label>截止时间（事件开始 ≤）<input type="datetime-local" id="ev-filter-end" step="1"></label>
+        <label>确认状态
+          <select id="ev-filter-ack">
+            <option value="">全部</option>
+            <option value="unacked">仅未确认</option>
+            <option value="acked">仅已确认</option>
+          </select>
+        </label>
+        <button class="btn ghost" id="btn-ev-clear-filters">清空筛选</button>
+      </div>
+    </div>
+
+    <div id="events-list" class="events-list" style="margin-top:16px"></div>
   </section>
 
   <!-- ===================== 抑制规则 ===================== -->

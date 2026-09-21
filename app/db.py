@@ -83,6 +83,29 @@ CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+-- 事件关联工作台：correlate() 全量重算后的事件快照
+CREATE TABLE IF NOT EXISTS correlation_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_key TEXT NOT NULL UNIQUE,        -- 由成员 alert_id 集合派生的稳定标识
+    device_id TEXT DEFAULT '',
+    alert_type TEXT DEFAULT '',
+    start_ts TEXT NOT NULL,
+    end_ts TEXT NOT NULL,
+    max_level TEXT NOT NULL DEFAULT 'info',
+    alert_count INTEGER NOT NULL,
+    member_ids TEXT NOT NULL,              -- JSON: 按时间排序的 alert_id 列表
+    member_seqs TEXT NOT NULL,             -- JSON: 与 member_ids 对齐的注入序号
+    computed_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- 事件确认状态：以 event_key 关联；成员集合不变（key 不变）即可跨重算保留
+CREATE TABLE IF NOT EXISTS event_acknowledgements (
+    event_key TEXT PRIMARY KEY,
+    acknowledged INTEGER NOT NULL DEFAULT 0,
+    acknowledged_at TEXT,
+    note TEXT DEFAULT ''
+);
 """
 
 _RULE_COLS = [
@@ -95,6 +118,8 @@ DEFAULT_SETTINGS = {
     "forward_enabled": "false",
     "receiver_mode": "mock",      # mock=内置模拟接收端; external=自定义 webhook
     "external_url": "http://receiver:9000/mock-webhook",
+    # 事件关联：同一 device_id+alert_type 组内相邻告警的最大聚合间隔（秒）
+    "correlation_interval_seconds": "900",
 }
 
 
@@ -196,7 +221,8 @@ def reset_all(conn) -> None:
     try:
         conn.executescript(
             "DELETE FROM decisions; DELETE FROM receiver_logs; DELETE FROM staged; "
-            "DELETE FROM alerts; DELETE FROM rules; DELETE FROM runs;"
+            "DELETE FROM alerts; DELETE FROM rules; DELETE FROM runs; "
+            "DELETE FROM correlation_events; DELETE FROM event_acknowledgements;"
         )
         inserted_ids = []
         for rule in seed_rules():
@@ -246,7 +272,8 @@ def init_db(force_seed: bool = False) -> None:
                 if force_seed:
                     conn.executescript(
                         "DELETE FROM decisions; DELETE FROM receiver_logs; "
-                        "DELETE FROM staged; DELETE FROM alerts; DELETE FROM rules; DELETE FROM runs;"
+                        "DELETE FROM staged; DELETE FROM alerts; DELETE FROM rules; DELETE FROM runs; "
+                        "DELETE FROM correlation_events; DELETE FROM event_acknowledgements;"
                     )
                 for rule in seed_rules():
                     conn.execute(

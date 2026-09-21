@@ -16,6 +16,13 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import db
+from .correlation import (
+    DEFAULT_INTERVAL_SECONDS,
+    LEVEL_RANK,
+    MAX_INTERVAL_SECONDS,
+    correlate,
+    normalize_interval_seconds,
+)
 from .engine import (
     LEVELS,
     EvalState,
@@ -27,7 +34,7 @@ from .engine import (
     ordered_rules,
 )
 
-app = FastAPI(title="冷链告警抑制策略沙盒", version="1.0.0")
+app = FastAPI(title="冷链告警抑制策略沙盒", version="1.1.0")
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
@@ -203,12 +210,96 @@ def _inject_one(conn, payload: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# 事件关联（与 live/replay 决定完全解耦：只读取 alerts，不触碰 decisions/runs）
+# ---------------------------------------------------------------------------
+
+def _get_interval_seconds(conn) -> int:
+    row = conn.execute(
+        "SELECT value FROM settings WHERE key='correlation_interval_seconds'"
+    ).fetchone()
+    try:
+        return normalize_interval_seconds(row["value"] if row else DEFAULT_INTERVAL_SECONDS)
+    except ValueError:
+        return DEFAULT_INTERVAL_SECONDS
+
+
+def _load_alerts_with_ts(conn) -> list[dict]:
+    """读取全部已注入告警并把 ts 还原为 datetime（供纯函数关联引擎使用）。"""
+    rows = conn.execute("SELECT * FROM alerts ORDER BY seq").fetchall()
+    alerts = []
+    for row in rows:
+        alert = _alert_dict(row)
+        alert["ts"] = datetime.fromisoformat(alert["ts"])
+        alerts.append(alert)
+    return alerts
+
+
+def recompute_events(conn) -> dict:
+    """按当前间隔对全部已注入告警做确定性全量重算并刷新事件快照。
+
+    调用方负责事务边界（通常已在 BEGIN 内或随当前写入一并提交）。
+    成员集合未变的事件复用同一 event_key，确认状态天然保留；
+    消失事件的旧确认记录保留在 event_acknowledgements 中（不影响结果），
+    以便撤销注入等操作后事件以相同成员集合重新出现时恢复确认。
+    """
+    interval = _get_interval_seconds(conn)
+    alerts = _load_alerts_with_ts(conn)
+    events = correlate(alerts, interval)
+
+    conn.execute("DELETE FROM correlation_events")
+    for ev in events:
+        conn.execute(
+            """INSERT INTO correlation_events
+               (event_key, device_id, alert_type, start_ts, end_ts, max_level,
+                alert_count, member_ids, member_seqs)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                ev.event_key, ev.device_id, ev.alert_type,
+                ev.start_ts.isoformat(timespec="seconds"),
+                ev.end_ts.isoformat(timespec="seconds"),
+                ev.max_level, ev.alert_count,
+                json.dumps(ev.member_ids), json.dumps(ev.member_seqs),
+            ),
+        )
+    return {"interval_seconds": interval, "event_count": len(events),
+            "alert_count": len(alerts)}
+
+
+def _parse_filter_ts(value: Optional[str], field_name: str) -> Optional[datetime]:
+    if value is None or str(value).strip() == "":
+        return None
+    text = str(value).strip()
+    try:
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        dt = datetime.fromisoformat(text)
+        return dt.astimezone().replace(tzinfo=None) if dt.tzinfo else dt
+    except ValueError:
+        raise HTTPException(400, f"{field_name} 需为 ISO 8601 时间，如 2026-09-21T00:00:00")
+
+
+# ---------------------------------------------------------------------------
 # 启动
 # ---------------------------------------------------------------------------
 
 @app.on_event("startup")
 def _startup() -> None:
     db.init_db()
+    # 升级场景（旧库新建了事件表但未填充）：有已注入告警而无事件快照时补算一次
+    conn = db.get_conn()
+    try:
+        ev_n = conn.execute("SELECT COUNT(*) FROM correlation_events").fetchone()[0]
+        al_n = conn.execute("SELECT COUNT(*) FROM alerts").fetchone()[0]
+        if ev_n == 0 and al_n > 0:
+            conn.execute("BEGIN")
+            try:
+                recompute_events(conn)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+    finally:
+        conn.close()
 
 
 @app.exception_handler(HTTPException)
@@ -392,6 +483,7 @@ def inject_next():
         payload = json.loads(row["payload"])
         conn.execute("DELETE FROM staged WHERE id=?", (row["id"],))
         out = _inject_one(conn, payload)
+        out["correlation"] = recompute_events(conn)
         conn.commit()
         out["staged_remaining"] = conn.execute("SELECT COUNT(*) FROM staged").fetchone()[0]
         return out
@@ -411,8 +503,9 @@ def inject_all():
         for row in rows:
             results.append(_inject_one(conn, json.loads(row["payload"])))
         conn.execute("DELETE FROM staged")
+        correlation = recompute_events(conn)
         conn.commit()
-        return {"injected": len(results), "results": results}
+        return {"injected": len(results), "results": results, "correlation": correlation}
     finally:
         conn.close()
 
@@ -426,6 +519,7 @@ async def inject_single(request: Request):
     conn = db.get_conn()
     try:
         out = _inject_one(conn, payload)
+        out["correlation"] = recompute_events(conn)
         conn.commit()
         return out
     finally:
@@ -471,12 +565,14 @@ def undo_last():
             # 级联删除各 run 中该告警的 decisions 与投递日志
             conn.execute("DELETE FROM receiver_logs WHERE alert_id=?", (last["id"],))
             conn.execute("DELETE FROM alerts WHERE id=?", (last["id"],))
+            correlation = recompute_events(conn)
             conn.commit()
         except Exception:
             conn.rollback()
             raise
         return {"ok": True, "undone": alert,
-                "remaining": conn.execute("SELECT COUNT(*) FROM alerts").fetchone()[0]}
+                "remaining": conn.execute("SELECT COUNT(*) FROM alerts").fetchone()[0],
+                "correlation": correlation}
     finally:
         conn.close()
 
@@ -617,6 +713,212 @@ def compare_runs(run_a: int, run_b: Optional[int] = None):
         return {"run_a": run_meta(run_a), "run_b": run_meta(run_b),
                 "rows": rows_out, "changed_count": changed,
                 "total": len(rows_out)}
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# 事件关联工作台
+# ---------------------------------------------------------------------------
+
+@app.get("/api/correlation/config")
+def get_correlation_config():
+    """当前关联配置（聚合间隔）。"""
+    conn = db.get_conn()
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM correlation_events"
+        ).fetchone()
+        return {"correlation_interval_seconds": _get_interval_seconds(conn),
+                "event_count": row["n"],
+                "min_interval_seconds": 0,
+                "max_interval_seconds": MAX_INTERVAL_SECONDS}
+    finally:
+        conn.close()
+
+
+@app.put("/api/correlation/config")
+async def update_correlation_config(request: Request):
+    """修改聚合间隔并立即以新间隔全量重算（幂等、确定性；不影响 live/replay）。"""
+    body = await request.json()
+    if not isinstance(body, dict) or "correlation_interval_seconds" not in body:
+        raise HTTPException(400, "请求体需包含 correlation_interval_seconds")
+    try:
+        interval = normalize_interval_seconds(body["correlation_interval_seconds"])
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    conn = db.get_conn()
+    try:
+        conn.execute(
+            "INSERT INTO settings(key, value) VALUES ('correlation_interval_seconds', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (str(interval),),
+        )
+        conn.execute("BEGIN")
+        try:
+            summary = recompute_events(conn)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return {"correlation_interval_seconds": interval, **summary}
+    finally:
+        conn.close()
+
+
+@app.post("/api/correlation/recompute")
+def recompute_correlation():
+    """对全部已注入告警按当前间隔做一次确定性全量重算（乱序补入后可手动调用）。"""
+    conn = db.get_conn()
+    try:
+        conn.execute("BEGIN")
+        try:
+            summary = recompute_events(conn)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return {"ok": True, **summary}
+    finally:
+        conn.close()
+
+
+@app.get("/api/correlation/events")
+def list_correlation_events(
+    device: Optional[str] = None,
+    level: Optional[str] = None,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    acknowledged: Optional[bool] = None,
+):
+    """事件列表，支持按设备 / 最低级别 / 时间范围 / 确认状态筛选。
+
+    - level：保留**最高级别 >= 指定级别**的事件（warning 含 warning/critical）
+    - start/end：事件时间范围与 [start, end] 有重叠即保留（按首末时间）
+    - 每个事件携带成员时间线（含 live 链上的放行/抑制决定，只读展示）
+    """
+    min_rank = None
+    if level:
+        level = level.strip().lower()
+        if level not in LEVEL_RANK:
+            raise HTTPException(400, f"level 只能是 {', '.join(LEVEL_RANK)} 之一")
+        min_rank = LEVEL_RANK[level]
+    start_dt = _parse_filter_ts(start, "start")
+    end_dt = _parse_filter_ts(end, "end")
+    if start_dt and end_dt and start_dt > end_dt:
+        raise HTTPException(400, "start 不能晚于 end")
+
+    conn = db.get_conn()
+    try:
+        run_id = _live_run_id(conn)
+        rows = conn.execute(
+            """SELECT ce.*, ack.acknowledged, ack.acknowledged_at, ack.note AS ack_note
+               FROM correlation_events ce
+               LEFT JOIN event_acknowledgements ack ON ack.event_key=ce.event_key
+               ORDER BY ce.start_ts DESC, ce.device_id, ce.alert_type, ce.id"""
+        ).fetchall()
+
+        # 预取 live 决定，避免逐成员查询
+        dec_rows = conn.execute(
+            "SELECT alert_id, decision, rule_id, rule_name, reason FROM decisions WHERE run_id=?",
+            (run_id,),
+        ).fetchall()
+        decisions = {r["alert_id"]: dict(r) for r in dec_rows}
+        alert_rows = {r["id"]: r for r in conn.execute("SELECT * FROM alerts").fetchall()}
+
+        events = []
+        for r in rows:
+            if device is not None and device.strip() and r["device_id"] != device.strip():
+                continue
+            if min_rank is not None and LEVEL_RANK.get(r["max_level"], 1) < min_rank:
+                continue
+            ev_start = datetime.fromisoformat(r["start_ts"])
+            ev_end = datetime.fromisoformat(r["end_ts"])
+            if start_dt and ev_end < start_dt:
+                continue
+            if end_dt and ev_start > end_dt:
+                continue
+            is_acked = bool(r["acknowledged"])
+            if acknowledged is not None and is_acked != acknowledged:
+                continue
+
+            member_ids = json.loads(r["member_ids"])
+            member_seqs = json.loads(r["member_seqs"])
+            timeline = []
+            for aid, seq in zip(member_ids, member_seqs):
+                a = alert_rows.get(aid)
+                dec = decisions.get(aid)
+                timeline.append({
+                    "alert_id": aid,
+                    "seq": seq,
+                    "ts": a["ts"] if a else None,
+                    "device_id": a["device_id"] if a else r["device_id"],
+                    "batch_id": a["batch_id"] if a else "",
+                    "level": a["level"] if a else None,
+                    "alert_type": a["alert_type"] if a else r["alert_type"],
+                    "message": a["message"] if a else "",
+                    "live_decision": dec["decision"] if dec else None,
+                    "live_rule_id": dec["rule_id"] if dec else None,
+                    "live_rule_name": dec["rule_name"] if dec else None,
+                })
+            events.append({
+                "id": r["id"],
+                "event_key": r["event_key"],
+                "device_id": r["device_id"],
+                "alert_type": r["alert_type"],
+                "start_ts": r["start_ts"],
+                "end_ts": r["end_ts"],
+                "max_level": r["max_level"],
+                "alert_count": r["alert_count"],
+                "member_ids": member_ids,
+                "member_seqs": member_seqs,
+                "acknowledged": is_acked,
+                "acknowledged_at": r["acknowledged_at"],
+                "ack_note": r["ack_note"] or "",
+                "computed_at": r["computed_at"],
+                "timeline": timeline,
+            })
+        return {"interval_seconds": _get_interval_seconds(conn),
+                "total": len(events), "events": events}
+    finally:
+        conn.close()
+
+
+@app.post("/api/correlation/events/{event_key}/acknowledge")
+async def acknowledge_event(event_key: str, request: Request):
+    """确认 / 取消确认一个事件。body: {"acknowledged": true, "note": "..."}。
+
+    状态按 event_key（成员集合）持久化；重算后成员集合不变的事件保留状态。
+    """
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(400, "请求体必须是对象")
+    acked = bool(body.get("acknowledged", True))
+    note = str(body.get("note", "") or "")[:200]
+    conn = db.get_conn()
+    try:
+        if not conn.execute(
+            "SELECT 1 FROM correlation_events WHERE event_key=?", (event_key,)
+        ).fetchone():
+            raise HTTPException(404, "事件不存在或已因重算消失")
+        if acked:
+            conn.execute(
+                """INSERT INTO event_acknowledgements(event_key, acknowledged, acknowledged_at, note)
+                   VALUES (?, 1, datetime('now'), ?)
+                   ON CONFLICT(event_key) DO UPDATE SET
+                     acknowledged=1, acknowledged_at=datetime('now'), note=excluded.note""",
+                (event_key, note),
+            )
+        else:
+            conn.execute(
+                """INSERT INTO event_acknowledgements(event_key, acknowledged, acknowledged_at, note)
+                   VALUES (?, 0, NULL, '')
+                   ON CONFLICT(event_key) DO UPDATE SET
+                     acknowledged=0, acknowledged_at=NULL, note=''""",
+                (event_key,),
+            )
+        conn.commit()
+        return {"event_key": event_key, "acknowledged": acked}
     finally:
         conn.close()
 

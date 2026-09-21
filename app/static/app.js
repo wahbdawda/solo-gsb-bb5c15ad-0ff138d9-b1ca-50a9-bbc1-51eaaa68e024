@@ -19,6 +19,9 @@ let state = {
   runs: [],
   settings: {},
   compare: { a: null, b: null, result: null },
+  events: { total: 0, events: [], interval_seconds: 900 },
+  evConfig: { correlation_interval_seconds: 900 },
+  evFilters: { device: "", level: "", start: "", end: "", ack: "" },
 };
 
 // ---------------------------------------------------------------------------
@@ -61,6 +64,7 @@ async function refreshAll() {
   renderRunSelects();
   renderSettings();
   if (state.compare.a && state.compare.b) await loadCompare();
+  await loadEvents();
 }
 
 async function loadStaged() {
@@ -461,6 +465,150 @@ async function testMock() {
 }
 
 // ---------------------------------------------------------------------------
+// Tab 1b: 事件关联
+// ---------------------------------------------------------------------------
+
+function fmtTs(ts) {
+  // 后端存的是 naive ISO（YYYY-MM-DDTHH:MM:SS），直接按本地时间展示
+  return esc((ts || "").replace("T", " "));
+}
+
+function liveDecisionBadge(dec) {
+  if (!dec) return '<span class="badge">未评估</span>';
+  return dec === "pass"
+    ? '<span class="decision pass">live 放行</span>'
+    : '<span class="decision suppress">live 抑制</span>';
+}
+
+function evQueryString() {
+  const f = state.evFilters;
+  const p = new URLSearchParams();
+  if (f.device) p.set("device", f.device);
+  if (f.level) p.set("level", f.level);
+  if (f.start) p.set("start", f.start);
+  if (f.end) p.set("end", f.end);
+  if (f.ack === "acked") p.set("acknowledged", "true");
+  if (f.ack === "unacked") p.set("acknowledged", "false");
+  const qs = p.toString();
+  return qs ? `?${qs}` : "";
+}
+
+async function loadEvents() {
+  const [cfg, data] = await Promise.all([
+    api("/api/correlation/config"),
+    api(`/api/correlation/events${evQueryString()}`),
+  ]);
+  state.evConfig = cfg;
+  state.events = data;
+  renderEvents();
+}
+
+function renderEvents() {
+  $("#ev-interval-input").value = state.evConfig.correlation_interval_seconds;
+  $("#ev-interval").textContent = `间隔 ${state.evConfig.correlation_interval_seconds}s`;
+
+  // 设备下拉：从已注入告警收集（确定且无需额外接口）
+  const devices = [...new Set(state.alerts.map((x) => x.alert.device_id).filter(Boolean))].sort();
+  const devSel = $("#ev-filter-device");
+  const cur = state.evFilters.device;
+  devSel.innerHTML = '<option value="">全部设备</option>' +
+    devices.map((d) => `<option value="${esc(d)}"${d === cur ? " selected" : ""}>${esc(d)}</option>`).join("");
+
+  const list = state.events.events || [];
+  const unacked = list.filter((e) => !e.acknowledged).length;
+  $("#ev-total").textContent = `${state.events.total} 事件`;
+  $("#ev-unacked").textContent = `${unacked} 未确认`;
+
+  const box = $("#events-list");
+  if (!list.length) {
+    box.innerHTML = '<div class="card"><p class="empty">没有匹配的事件。先在「告警注入」页注入告警，或调整筛选条件 / 聚合间隔。</p></div>';
+    return;
+  }
+  box.innerHTML = list.map((e) => {
+    const seqs = e.member_seqs.join(", ");
+    const dur = (new Date(e.end_ts) - new Date(e.start_ts)) / 1000;
+    const durTxt = dur >= 60 ? `${Math.round(dur / 60)} 分钟` : `${dur} 秒`;
+    const tl = e.timeline.map((m) => `
+      <li>
+        <span class="tl-time">${fmtTs(m.ts)}</span>
+        <span class="tl-seq">#${m.seq}</span>
+        ${levelBadge(m.level)}
+        <span class="tl-msg">${esc(m.message || m.alert_type || "")}</span>
+        ${liveDecisionBadge(m.live_decision)}
+      </li>`).join("");
+    return `<div class="event-card ${e.acknowledged ? "acked" : "unacked"}" data-event-card="${esc(e.event_key)}">
+      <div class="event-head" data-toggle-event="${esc(e.event_key)}">
+        <span class="ev-title">${esc(e.device_id || "(无设备)")} · ${esc(e.alert_type || "(无类型)")}</span>
+        ${levelBadge(e.max_level)}
+        <span class="badge">${e.alert_count} 条告警</span>
+        <span class="ev-sub">${fmtTs(e.start_ts)} → ${fmtTs(e.end_ts)}（持续约 ${durTxt}）</span>
+        <span class="ev-sub">成员序号: ${esc(seqs)}</span>
+        <span class="spacer"></span>
+        ${e.acknowledged
+          ? `<span class="badge pass">✓ 已确认${e.acknowledged_at ? " " + esc(e.acknowledged_at) : ""}</span>`
+          : '<span class="badge suppress">● 未确认</span>'}
+        <span class="ev-actions">
+          <button class="btn small ${e.acknowledged ? "ghost" : "primary"}"
+            data-ack-event="${esc(e.event_key)}" data-ack-val="${e.acknowledged ? 0 : 1}">
+            ${e.acknowledged ? "取消确认" : "确认"}</button>
+        </span>
+      </div>
+      <div class="event-body collapsed" data-event-body="${esc(e.event_key)}">
+        <div class="ack-note">事件标识 <code>${esc(e.event_key)}</code>（成员集合不变即跨重算保留确认状态；最近重算 ${esc(e.computed_at)}）</div>
+        <ul class="timeline">${tl}</ul>
+      </div>
+    </div>`;
+  }).join("");
+}
+
+async function saveInterval() {
+  const val = Number($("#ev-interval-input").value);
+  try {
+    const r = await api("/api/correlation/config", {
+      method: "PUT", body: JSON.stringify({ correlation_interval_seconds: val }),
+    });
+    await loadEvents();
+    toast(`已按 ${r.interval_seconds}s 间隔重算，得到 ${r.event_count} 个事件（live/replay 决定不变）`);
+  } catch (e) { fail(e); }
+}
+
+async function recomputeEvents() {
+  try {
+    const r = await api("/api/correlation/recompute", { method: "POST" });
+    await loadEvents();
+    toast(`重算完成：${r.event_count} 个事件 / ${r.alert_count} 条告警`);
+  } catch (e) { fail(e); }
+}
+
+async function setEventAck(eventKey, acked) {
+  try {
+    await api(`/api/correlation/events/${encodeURIComponent(eventKey)}/acknowledge`, {
+      method: "POST", body: JSON.stringify({ acknowledged: !!acked }),
+    });
+    await loadEvents();
+  } catch (e) { fail(e); }
+}
+
+function syncFilterInputs() {
+  const f = state.evFilters;
+  $("#ev-filter-device").value = f.device;
+  $("#ev-filter-level").value = f.level;
+  $("#ev-filter-start").value = f.start;
+  $("#ev-filter-end").value = f.end;
+  $("#ev-filter-ack").value = f.ack;
+}
+
+function readEventFilters() {
+  state.evFilters = {
+    device: $("#ev-filter-device").value,
+    level: $("#ev-filter-level").value,
+    start: $("#ev-filter-start").value,
+    end: $("#ev-filter-end").value,
+    ack: $("#ev-filter-ack").value,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // 示例数据 & 重置
 // ---------------------------------------------------------------------------
 
@@ -510,6 +658,14 @@ document.addEventListener("click", async (e) => {
       await loadRules(); renderRules();
     } catch (err) { fail(err); }
   }
+  if (ds.ackEvent) {
+    e.stopPropagation();  // 避免冒泡到 .event-head 触发折叠
+    await setEventAck(ds.ackEvent, ds.ackVal === "1");
+  }
+  if (ds.toggleEvent) {
+    const body = document.querySelector(`[data-event-body="${CSS.escape(ds.toggleEvent)}"]`);
+    if (body) body.classList.toggle("collapsed");
+  }
 });
 
 function bind() {
@@ -519,6 +675,7 @@ function bind() {
     btn.classList.add("active");
     $(`#tab-${btn.dataset.tab}`).classList.add("active");
     if (btn.dataset.tab === "receiver") loadReceiverLogs();
+    if (btn.dataset.tab === "events") { syncFilterInputs(); loadEvents().catch(fail); }
   }));
 
   $("#btn-inject-next").addEventListener("click", () => doInject(true));
@@ -541,6 +698,20 @@ function bind() {
   $("#btn-clear-logs").addEventListener("click", async () => {
     try { await api("/api/receiver/clear", { method: "POST" }); await loadReceiverLogs(); toast("日志已清空"); }
     catch (err) { fail(err); }
+  });
+
+  // 事件关联
+  $("#btn-ev-save-interval").addEventListener("click", saveInterval);
+  $("#btn-ev-recompute").addEventListener("click", recomputeEvents);
+  ["#ev-filter-device", "#ev-filter-level", "#ev-filter-start", "#ev-filter-end", "#ev-filter-ack"]
+    .forEach((sel) => $(sel).addEventListener("change", () => {
+      readEventFilters();
+      loadEvents().catch(fail);
+    }));
+  $("#btn-ev-clear-filters").addEventListener("click", () => {
+    state.evFilters = { device: "", level: "", start: "", end: "", ack: "" };
+    syncFilterInputs();
+    loadEvents().catch(fail);
   });
 }
 

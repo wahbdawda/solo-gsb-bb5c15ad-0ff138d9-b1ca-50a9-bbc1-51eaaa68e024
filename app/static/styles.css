@@ -183,3 +183,50 @@ tr:hover td { background: rgba(56, 189, 248, 0.04); }
 }
 .toast.show { transform: translateX(-50%) translateY(0); }
 .toast.error { border-color: var(--red); }
+
+/* ---------------- 事件关联工作台 ---------------- */
+.ev-filters {
+  display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-end;
+  border-top: 1px solid var(--border); padding-top: 12px;
+}
+.ev-filters label { min-width: 180px; margin-bottom: 0; flex: 1; }
+
+.events-list { display: flex; flex-direction: column; gap: 12px; }
+.event-card {
+  background: var(--panel); border: 1px solid var(--border);
+  border-left-width: 4px; border-radius: var(--radius); padding: 14px 16px;
+}
+.event-card.unacked { border-left-color: var(--amber); }
+.event-card.acked { border-left-color: var(--green); opacity: 0.85; }
+.event-head {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  cursor: pointer;
+}
+.event-head .ev-title { font-size: 14.5px; font-weight: 700; }
+.event-head .ev-sub { color: var(--muted); font-size: 12.5px; }
+.event-head .spacer { flex: 1; }
+.ev-actions { display: flex; gap: 6px; }
+.event-body { margin-top: 10px; }
+.event-body.collapsed { display: none; }
+
+.timeline {
+  margin: 10px 0 0; padding: 0; list-style: none;
+  border-left: 2px solid var(--border);
+}
+.timeline li {
+  position: relative; padding: 6px 0 6px 18px; margin-left: 8px;
+  border-bottom: 1px dashed rgba(42, 58, 77, 0.6);
+  font-size: 12.5px;
+}
+.timeline li:last-child { border-bottom: none; }
+.timeline li::before {
+  content: ""; position: absolute; left: -6px; top: 12px;
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--accent-dim); border: 2px solid var(--panel);
+}
+.timeline .tl-time { color: var(--accent); font-family: "SF Mono", Consolas, monospace; }
+.timeline .tl-seq { color: var(--muted); margin-left: 6px; }
+.timeline .tl-msg { color: var(--text); margin: 0 6px; }
+.timeline .tl-dec { margin-left: 6px; font-size: 11.5px; }
+.ack-note { font-size: 12px; color: var(--muted); margin-top: 6px; }
+.ack-note input { margin-top: 4px; }

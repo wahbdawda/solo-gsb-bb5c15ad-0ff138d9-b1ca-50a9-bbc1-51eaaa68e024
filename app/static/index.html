@@ -17,6 +17,7 @@
   </div>
   <nav class="tabs">
     <button class="tab active" data-tab="inject">告警注入</button>
+    <button class="tab" data-tab="events">事件关联</button>
     <button class="tab" data-tab="rules">抑制规则</button>
     <button class="tab" data-tab="compare">策略对比</button>
     <button class="tab" data-tab="receiver">模拟接收端</button>
@@ -68,6 +69,56 @@
           <tbody id="alerts-body"><tr><td colspan="9" class="empty">尚未注入告警</td></tr></tbody>
         </table>
       </div>
+    </div>
+  </section>
+
+  <!-- ===================== 事件关联 ===================== -->
+  <section id="tab-events" class="panel">
+    <div class="card">
+      <h2>事件关联设置</h2>
+      <p class="hint">对<strong>全部已注入告警</strong>按 <code>device_id + alert_type</code> 分组，组内按告警时间排序，相邻两条时间差不超过聚合间隔即归入同一事件。
+        关联结果<strong>只取决于告警集合与间隔</strong>：乱序注入、修改间隔后重算都会得到确定性结果；事件关联独立于 live/replay 评估链，<strong>不会改变任何放行/抑制决定</strong>。</p>
+      <div class="toolbar">
+        <label style="margin:0;flex:0 0 300px">聚合间隔 gap_seconds（秒，相邻告警 &le; 间隔即同事件）
+          <input id="ev-gap" type="number" min="0" max="31622400" value="900">
+        </label>
+        <button class="btn primary" id="btn-save-gap" style="align-self:flex-end">保存间隔并重算</button>
+        <button class="btn" id="btn-recompute" style="align-self:flex-end">🔁 立即重算事件</button>
+        <span class="badge" id="ev-gap-saved" style="align-self:center"></span>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:16px">
+      <h2>事件列表
+        <span class="badge" id="ev-total">0 事件</span>
+        <span class="badge pass" id="ev-acked">0 已确认</span>
+        <span class="badge suppress" id="ev-unacked">0 未确认</span>
+      </h2>
+      <div class="toolbar filters">
+        <label style="margin:0">设备
+          <select id="ev-filter-device"><option value="">全部设备</option></select>
+        </label>
+        <label style="margin:0">最高级别
+          <select id="ev-filter-level">
+            <option value="">全部级别</option>
+            <option value="critical">critical</option>
+            <option value="warning">warning</option>
+            <option value="info">info</option>
+          </select>
+        </label>
+        <label style="margin:0">确认状态
+          <select id="ev-filter-status">
+            <option value="">全部</option>
+            <option value="unacknowledged">未确认</option>
+            <option value="acknowledged">已确认</option>
+          </select>
+        </label>
+        <label style="margin:0">时间起<br><input id="ev-filter-start" type="datetime-local"></label>
+        <label style="margin:0">时间止<br><input id="ev-filter-end" type="datetime-local"></label>
+        <button class="btn ghost" id="btn-clear-filters" style="align-self:flex-end">清除筛选</button>
+      </div>
+      <p class="hint">时间筛选取<strong>时间区间有重叠</strong>的事件；每个事件可展开查看成员序号与完整时间线（含 live 链决定）。</p>
+      <div id="events-list" class="event-list"></div>
     </div>
   </section>
 

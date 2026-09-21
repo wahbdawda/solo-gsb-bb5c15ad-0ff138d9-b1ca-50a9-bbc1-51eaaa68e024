@@ -183,3 +183,48 @@ tr:hover td { background: rgba(56, 189, 248, 0.04); }
 }
 .toast.show { transform: translateX(-50%) translateY(0); }
 .toast.error { border-color: var(--red); }
+
+/* ---------------- 事件关联工作台 ---------------- */
+.filters { align-items: flex-end; }
+.filters label { min-width: 150px; }
+.event-list { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; }
+.event-card {
+  border: 1px solid var(--border); border-radius: 10px;
+  background: var(--panel-2); padding: 12px 14px;
+  border-left: 3px solid var(--amber);
+}
+.event-card.is-ack { border-left-color: var(--green); opacity: 0.92; }
+.ev-head { display: flex; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.ev-title { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.ev-title b { font-size: 14.5px; }
+.ev-meta {
+  display: flex; gap: 18px; flex-wrap: wrap;
+  color: var(--muted); font-size: 12.5px; margin: 8px 0 4px;
+}
+.ev-meta b { color: var(--text); font-weight: 600; }
+.ev-seqs { display: flex; gap: 4px; flex-wrap: wrap; align-items: center; margin: 6px 0; font-size: 12.5px; color: var(--muted); }
+.seq-chip {
+  display: inline-block; background: var(--bg); border: 1px solid var(--border);
+  border-radius: 999px; padding: 1px 9px; font-size: 11.5px; color: var(--accent);
+}
+.ev-timeline summary {
+  cursor: pointer; color: var(--accent); font-size: 12.5px;
+  list-style: revert; padding: 4px 0;
+}
+.tl-list { list-style: none; margin: 8px 0 0; padding: 0; }
+.tl-item {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  border-left: 2px solid var(--border); padding: 5px 0 5px 12px; margin-left: 6px;
+  position: relative; font-size: 12.5px;
+}
+.tl-dot {
+  width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
+  margin-left: -17px; background: var(--muted);
+}
+.level-dot-critical { background: var(--red); }
+.level-dot-warning { background: var(--amber); }
+.level-dot-info { background: var(--muted); }
+.tl-seq { font-weight: 700; color: var(--text); min-width: 30px; }
+.tl-ts { color: var(--muted); font-family: "SF Mono", Consolas, monospace; font-size: 11.5px; }
+.tl-msg { color: var(--text); flex: 1; min-width: 180px; }
+.decision.small { font-size: 11px; padding: 1px 7px; }

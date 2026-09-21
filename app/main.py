@@ -16,6 +16,13 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import db
+from .correlation import (
+    DEFAULT_GAP_SECONDS,
+    correlate_events,
+    event_signature,
+    normalize_gap,
+    parse_filter_ts,
+)
 from .engine import (
     LEVELS,
     EvalState,
@@ -393,6 +400,7 @@ def inject_next():
         conn.execute("DELETE FROM staged WHERE id=?", (row["id"],))
         out = _inject_one(conn, payload)
         conn.commit()
+        _reconcile_events(conn, _get_gap(conn))
         out["staged_remaining"] = conn.execute("SELECT COUNT(*) FROM staged").fetchone()[0]
         return out
     finally:
@@ -412,6 +420,7 @@ def inject_all():
             results.append(_inject_one(conn, json.loads(row["payload"])))
         conn.execute("DELETE FROM staged")
         conn.commit()
+        _reconcile_events(conn, _get_gap(conn))
         return {"injected": len(results), "results": results}
     finally:
         conn.close()
@@ -427,6 +436,7 @@ async def inject_single(request: Request):
     try:
         out = _inject_one(conn, payload)
         conn.commit()
+        _reconcile_events(conn, _get_gap(conn))
         return out
     finally:
         conn.close()
@@ -475,8 +485,304 @@ def undo_last():
         except Exception:
             conn.rollback()
             raise
+        _reconcile_events(conn, _get_gap(conn))
         return {"ok": True, "undone": alert,
                 "remaining": conn.execute("SELECT COUNT(*) FROM alerts").fetchone()[0]}
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# 事件关联（与 live/replay 评估完全独立：只读写 events 表）
+# ---------------------------------------------------------------------------
+
+def _load_all_alerts(conn) -> list[dict]:
+    rows = conn.execute("SELECT * FROM alerts ORDER BY seq").fetchall()
+    alerts = []
+    for row in rows:
+        alert = _alert_dict(row)
+        alert["ts"] = datetime.fromisoformat(alert["ts"])
+        alerts.append(alert)
+    return alerts
+
+
+def _get_gap(conn) -> int:
+    raw = conn.execute(
+        "SELECT value FROM settings WHERE key='correlation_gap_seconds'"
+    ).fetchone()
+    try:
+        return normalize_gap(raw["value"] if raw else DEFAULT_GAP_SECONDS)
+    except ValueError:
+        return DEFAULT_GAP_SECONDS
+
+
+def _pick_legacy(
+    candidates: list[Any], member_ids: set[int]
+) -> Optional[Any]:
+    """间隔修改导致事件拆分/合并时，确定性挑选确认状态的继承来源。
+
+    规则（无随机性、与调用次数无关）：成员重叠数最多 → 旧事件独有成员最少
+    （即更接近包含关系）→ 旧事件 id 最小。
+    """
+    def score(row) -> tuple[int, int, int]:
+        old_ids = set(json.loads(row["member_ids"]))
+        overlap = len(old_ids & member_ids)
+        return (overlap, -(len(old_ids - member_ids)), -row["id"])
+
+    if not candidates:
+        return None
+    best = max(candidates, key=score)
+    return best if set(json.loads(best["member_ids"])) & member_ids else None
+
+
+def _reconcile_events(conn, gap_seconds: int) -> dict:
+    """按当前告警集合与间隔确定性重算事件，并与已持久化行对齐。
+
+    - 内容签名不变的事件原样保留（含确认状态）；
+    - 新出现的签名插入；间隔修改导致拆分/合并时，从旧事件确定性继承确认状态；
+    - 消失的旧事件删除；
+    - 仅操作 events 表，不触碰 alerts / decisions / runs / receiver_logs。
+    """
+    alerts = _load_all_alerts(conn)
+    grouped = correlate_events(alerts, gap_seconds)
+    new_sigs = {
+        event_signature(gap_seconds, e["device_id"], e["alert_type"], e["member_ids"]): e
+        for e in grouped
+    }
+
+    old_rows = conn.execute("SELECT * FROM events").fetchall()
+    old_by_sig = {r["signature"]: r for r in old_rows}
+    stale = [r for r in old_rows if r["signature"] not in new_sigs]
+    used_legacy: set[int] = set()
+
+    created = updated = 0
+    conn.execute("BEGIN")
+    try:
+        for sig, event in new_sigs.items():
+            member_ids = json.dumps(event["member_ids"])
+            member_seqs = json.dumps(event["member_seqs"])
+            first_ts = event["first_ts"].isoformat(timespec="seconds")
+            last_ts = event["last_ts"].isoformat(timespec="seconds")
+            existing = old_by_sig.get(sig)
+            if existing is not None:
+                conn.execute(
+                    """UPDATE events SET device_id=?, alert_type=?, gap_seconds=?,
+                       first_ts=?, last_ts=?, alert_count=?, max_level=?,
+                       member_ids=?, member_seqs=?, updated_at=datetime('now')
+                       WHERE id=?""",
+                    (event["device_id"], event["alert_type"], gap_seconds,
+                     first_ts, last_ts, event["alert_count"], event["max_level"],
+                     member_ids, member_seqs, existing["id"]),
+                )
+                updated += 1
+                continue
+
+            ack, acked_at = 0, None
+            candidates = [
+                r for r in stale
+                if r["id"] not in used_legacy
+                and r["device_id"] == event["device_id"]
+                and r["alert_type"] == event["alert_type"]
+                and r["acknowledged"]
+            ]
+            legacy = _pick_legacy(candidates, set(event["member_ids"]))
+            if legacy is not None:
+                used_legacy.add(legacy["id"])
+                ack, acked_at = 1, legacy["acked_at"]
+
+            conn.execute(
+                """INSERT INTO events(signature, device_id, alert_type, gap_seconds,
+                   first_ts, last_ts, alert_count, max_level, member_ids, member_seqs,
+                   acknowledged, acked_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (sig, event["device_id"], event["alert_type"], gap_seconds,
+                 first_ts, last_ts, event["alert_count"], event["max_level"],
+                 member_ids, member_seqs, ack, acked_at),
+            )
+            created += 1
+
+        deleted = 0
+        for row in stale:
+            conn.execute("DELETE FROM events WHERE id=?", (row["id"],))
+            deleted += 1
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+    return {"gap_seconds": gap_seconds, "events": len(new_sigs),
+            "created": created, "updated": updated, "deleted": deleted}
+
+
+def _event_dict(conn, row, live_run_id: int) -> dict:
+    member_ids = json.loads(row["member_ids"])
+    members = []
+    for mid in member_ids:
+        a = conn.execute("SELECT * FROM alerts WHERE id=?", (mid,)).fetchone()
+        if not a:
+            continue  # 成员告警被撤销后，下次 reconcile 会重算；这里容错跳过
+        d = conn.execute(
+            "SELECT * FROM decisions WHERE run_id=? AND alert_id=?",
+            (live_run_id, mid),
+        ).fetchone()
+        members.append({
+            "alert": _alert_dict(a),
+            "live_decision": _decision_dict(d)["decision"] if d else None,
+        })
+    return {
+        "id": row["id"],
+        "device_id": row["device_id"],
+        "alert_type": row["alert_type"],
+        "gap_seconds": row["gap_seconds"],
+        "first_ts": row["first_ts"],
+        "last_ts": row["last_ts"],
+        "alert_count": row["alert_count"],
+        "max_level": row["max_level"],
+        "member_ids": member_ids,
+        "member_seqs": json.loads(row["member_seqs"]),
+        "acknowledged": bool(row["acknowledged"]),
+        "acked_at": row["acked_at"],
+        "note": row["note"] or "",
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "members": members,
+    }
+
+
+@app.get("/api/events")
+def list_events(
+    device: str = "",
+    level: str = "",
+    status: str = "",
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+):
+    """事件列表（自动按当前告警集合与已保存间隔确定性重算），支持筛选。
+
+    - device: 精确匹配 device_id；level: 事件最高级别精确匹配；
+    - status: acknowledged / unacknowledged；
+    - start/end: ISO8601，事件时间区间与筛选窗口有重叠即返回。
+    """
+    if level and level not in LEVELS:
+        raise HTTPException(400, f"level 只能是 {', '.join(LEVELS)} 之一")
+    if status and status not in ("ack", "acknowledged", "unack", "unacknowledged", "all"):
+        raise HTTPException(400, "status 只能是 acknowledged 或 unacknowledged")
+    try:
+        start_dt = parse_filter_ts(start, "start")
+        end_dt = parse_filter_ts(end, "end")
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    if start_dt and end_dt and start_dt > end_dt:
+        raise HTTPException(400, "start 不能晚于 end")
+
+    conn = db.get_conn()
+    try:
+        gap = _get_gap(conn)
+        stats = _reconcile_events(conn, gap)
+        live_id = _live_run_id(conn)
+        rows = conn.execute("SELECT * FROM events ORDER BY last_ts DESC, id DESC").fetchall()
+        events = []
+        for row in rows:
+            if device and row["device_id"] != device.strip():
+                continue
+            if level and row["max_level"] != level:
+                continue
+            want_ack = status in ("ack", "acknowledged")
+            if status in ("ack", "acknowledged", "unack", "unacknowledged") \
+                    and bool(row["acknowledged"]) != want_ack:
+                continue
+            first_dt = datetime.fromisoformat(row["first_ts"])
+            last_dt = datetime.fromisoformat(row["last_ts"])
+            if start_dt and last_dt < start_dt:
+                continue
+            if end_dt and first_dt > end_dt:
+                continue
+            events.append(_event_dict(conn, row, live_id))
+
+        devices = [r["device_id"] for r in conn.execute(
+            "SELECT DISTINCT device_id FROM events ORDER BY device_id"
+        ).fetchall()]
+        ack_count = conn.execute(
+            "SELECT COUNT(*) FROM events WHERE acknowledged=1"
+        ).fetchone()[0]
+        return {
+            "gap_seconds": gap,
+            "events": events,
+            "devices": devices,
+            "total": len(events),
+            "acknowledged_count": ack_count,
+            "unacknowledged_count": len(rows) - ack_count,
+            "recompute": stats,
+        }
+    finally:
+        conn.close()
+
+
+@app.post("/api/events/{event_id}/ack")
+def acknowledge_event(event_id: int, payload: dict = Body(default={})):
+    """确认（acknowledged=true）或取消确认（false）一个事件。"""
+    ack = bool((payload or {}).get("acknowledged", True))
+    conn = db.get_conn()
+    try:
+        row = conn.execute("SELECT * FROM events WHERE id=?", (event_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "事件不存在（可能因重算而合并/删除，刷新后重试）")
+        if ack:
+            conn.execute(
+                "UPDATE events SET acknowledged=1, acked_at=datetime('now'), "
+                "updated_at=datetime('now') WHERE id=?",
+                (event_id,),
+            )
+        else:
+            conn.execute(
+                "UPDATE events SET acknowledged=0, acked_at=NULL, "
+                "updated_at=datetime('now') WHERE id=?",
+                (event_id,),
+            )
+        conn.commit()
+        out = conn.execute("SELECT * FROM events WHERE id=?", (event_id,)).fetchone()
+        return _event_dict(conn, out, _live_run_id(conn))
+    finally:
+        conn.close()
+
+
+@app.get("/api/correlation/config")
+def get_correlation_config():
+    conn = db.get_conn()
+    try:
+        return {"gap_seconds": _get_gap(conn)}
+    finally:
+        conn.close()
+
+
+@app.put("/api/correlation/config")
+def update_correlation_config(payload: dict = Body(...)):
+    """修改聚合间隔并立即确定性重算。仅影响事件关联结果，不触碰 live/replay 决定。"""
+    try:
+        gap = normalize_gap((payload or {}).get("gap_seconds"))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    conn = db.get_conn()
+    try:
+        conn.execute(
+            "INSERT INTO settings(key, value) VALUES ('correlation_gap_seconds', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (str(gap),),
+        )
+        conn.commit()
+        stats = _reconcile_events(conn, gap)
+        return {"gap_seconds": gap, "recompute": stats}
+    finally:
+        conn.close()
+
+
+@app.post("/api/events/recompute")
+def recompute_events():
+    """用当前间隔对全部已注入告警手动重算事件（幂等，结果确定）。"""
+    conn = db.get_conn()
+    try:
+        gap = _get_gap(conn)
+        return _reconcile_events(conn, gap)
     finally:
         conn.close()
 
@@ -726,6 +1032,7 @@ def reset_sandbox():
     conn = db.get_conn()
     try:
         db.reset_all(conn)
+        _reconcile_events(conn, _get_gap(conn))
         return {"ok": True}
     finally:
         conn.close()
